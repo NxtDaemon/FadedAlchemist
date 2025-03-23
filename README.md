@@ -1,3 +1,6 @@
-# FadedAlchemist - University Dissertation Project
+# Faded Alchemist - Registry Malware Artefact Discovery
+<p align="center"">
+  <img src="https://github.com/user-attachments/assets/687ae19c-c6e5-4a24-8b31-03ac6cef5974" />
+</p>
 
-![alchemy-min](https://github.com/user-attachments/assets/dc4455ed-0585-4a94-add8-ad609238e3f9)
+
