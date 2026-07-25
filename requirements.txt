@@ -1,4 +1,4 @@
-regipy
+regipy[rust]
 tldextract
 rich
 pandas
