@@ -1,2 +1,4 @@
 regipy
 tldextract
+rich
+pandas
