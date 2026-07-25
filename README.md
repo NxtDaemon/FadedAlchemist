@@ -1,29 +1,83 @@
-<p align="center"">
-  <img src="https://github.com/user-attachments/assets/687ae19c-c6e5-4a24-8b31-03ac6cef5974" />
+<p align="center">
+  <img src="images/logo.png" style="max-width: 300px"/>
 </p>
 
+# FadedAlchemist — Registry Malware Artefact Discovery
 
-# Faded Alchemist - Registry Malware Artefact Discovery
-FadedAlchemist is an MVP for malware-induced Windows Registry modification detection that uses the [Acquire](https://github.com/fox-it/acquire) project to perform samples collections from VMs
+FadedAlchemist detects malware-induced Windows Registry modifications. Point it at a directory of collected hives — e.g. output from [Acquire](https://github.com/fox-it/acquire) — and it will extract persistence mechanisms, statistically anomalous values, and results from regipy's built-in forensic plugins.
 
-## How to Run Faded Alchemist 
-The following commands show how to run FadedAlchemist in it's intended format
+## What it does
+- **Persistence discovery (ASEP)** — Detects known Auto-Start Extensibility Points (Run keys, scheduled tasks, services) for ASEP vectors.
+- **Statistical artefact analysis** — Scores extracted values on Shannon entropy, Chi-Squared Randomness, Length, and Flags (IP/URL/B64D Detection) to surface values that look attacker-planted rather than legitimate configuration.
+- **Baselining** — collect a "known good" baseline from a clean device and subtract it from a sample to cut straight to what changed.
+- **regipy plugin integration** — runs any of regipy's 70+ bundled artefact plugins (Amcache, ShimCache, UserAssist, Shellbags, etc.) against the collected hives.
+- **Transaction log replay** — detects dirty hives and can replay their `.LOG1`/`.LOG2` transaction logs to recover the latest state before analysis.
 
-### Collect Baseline Data (Optional)
+## Installation
+
+Requires Python 3.11+.
 
 ```
-> python .\Alchemist.py -c -D X:\Path\To\Acquire\Collection --collect-baseline
+pip install -r requirements.txt
 ```
 
-### Process Sample with Baseline Reduction 
+FadedAlchemist V2 uses the new accelerated [regipy Rust backend](https://github.com/mkorman90/regipy) which speeds up key extraction around 600x
+
+## Usage
+
+Faded Alchemist is invoked as `Alchemist.py <mode> -d <path> [options]`. Every mode reads hives from the given directory; which files count as hives, and which subdirectories are skipped as duplicates/irrelevant (e.g. `regback`, `Default`), is defined in `Alchemist.HIVE_NAMES`/`DEFEAT_DIRECTORIES`.
+
+| Mode            | Description                                                                        |
+| --------------- | ---------------------------------------------------------------------------------- |
+| `comprehensive` | Runs both `persistence` and `artefacts` analysis                                   |
+| `persistence`   | Discovers ASEP persistence mechanisms only (fast — skips full key extraction)      |
+| `artefacts`     | Runs the statistical entropy/chi-squared/length/marks analysis only                |
+| `plugins`       | Runs regipy's built-in artefact plugins against each hive                          |
+| `list-plugins`  | Lists every available regipy plugin (name, compatible hive, description) and exits |
+
+### Collect a baseline (optional)
+
+Run against a clean reference image so its values can be subtracted from later scans:
 
 ```
-python .\Alchemist.py -c -D X:\Path\To\Acquire\Collect --use-baseline .\baseline.p -N MySampleName
+python .\Alchemist.py comprehensive -d X:\Path\To\Acquire\Collection --collect-baseline
 ```
 
-#### Example Output (ASEP)
+### Scan a sample, reduced against a baseline
+
 ```
-                                                                                       ASEP Keys                                                                                        
+python .\Alchemist.py comprehensive -d X:\Path\To\Acquire\Collection --use-baseline .\baseline\BaselineData_xxxx.p -n MySampleName
+```
+
+### Persistence-only scan (fastest)
+
+```
+python .\Alchemist.py persistence -d X:\Path\To\Acquire\Collection
+```
+
+### Run regipy plugins
+
+```
+python .\Alchemist.py plugins -d X:\Path\To\Acquire\Collection --plugins amcache,shimcache
+```
+
+## Output
+
+Every run creates an output directory named after `--name` (or a random designator if omitted), containing:
+
+| File                                             | Produced by                   | Contents                                                                |
+| ------------------------------------------------ | ----------------------------- | ----------------------------------------------------------------------- |
+| `<name>_ASEP_Results.{json,csv}`, `ASEP.table`   | `persistence`/`comprehensive` | Discovered autoruns, scheduled tasks, and services                      |
+| `<name>_Results.{json,csv,p}`, `Alchemist.table` | `artefacts`/`comprehensive`   | Values that passed the entropy/length/marks "meaningful" filter         |
+| `<name>_Plugins.{json,csv}`, `Plugins.table`     | `plugins`                     | Per-hive results from each regipy plugin that ran                       |
+| `BaselineData_<name>.{json,p}`                   | `--collect-baseline`          | Every extracted value, for use as `--use-baseline` input on a later run |
+
+`.table` files are plain-text snapshots of the Rich tables printed to console, for easy diffing/review outside a terminal.
+
+### Example output (ASEP)
+
+```
+                                                                                       ASEP Keys
 +--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | Method         | Value                                                                                                               | Context                                       |
 |----------------+---------------------------------------------------------------------------------------------------------------------+-----------------------------------------------|
@@ -45,54 +99,64 @@ python .\Alchemist.py -c -D X:\Path\To\Acquire\Collect --use-baseline .\baseline
 +--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 ```
 
-#### Example Output (Artefacts)
+### Example output (Artefacts)
+
 ```
 +--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | HIVE     | Key_Path                                                                                             | TS                  | Value_Name          | Value_Type | Value                               | Entropy            | ChiSquared         | Length | Marks      |
 |----------+------------------------------------------------------------------------------------------------------+---------------------+---------------------+------------+-----------------------------------------------------------------------------------------------------|
-| NTUSER   | \Software\Microsoft\EdgeUpdate\Clients\{F3C4FE00-EFD5-403B-9569-398A20F1BA4A}                        | 2025-03-26 11:51:59 | pv                  | REG_SZ     | 1.3.195.45                          | 2.4464393446710155 | N/a                | 10     | ['IP']     |
-| NTUSER   | \Software\Microsoft\EdgeUpdate\ClientState\{F3C4FE00-EFD5-403B-9569-398A20F1BA4A}                    | 2025-03-26 11:51:59 | pv                  | REG_SZ     | 1.3.195.45                          | 2.4464393446710155 | N/a                | 10     | ['IP']     |
-| NTUSER   | \Software\Microsoft\EdgeUpdate                                                                       | 2025-03-26 11:52:31 | version             | REG_SZ     | 1.3.195.45                          | 2.4464393446710155 | N/a                | 10     | ['IP']     |
 | NTUSER   | \Software\Microsoft\Windows\DWM                                                                      | 2025-03-26 11:55:16 | fjhsfgds            | REG_SZ     | 191_62_106_23                       | 2.6612262562697895 | N/a                | 13     | ['IP']     |
 | NTUSER   | \Software\Microsoft\Windows\DWM                                                                      | 2025-03-26 11:55:16 | 6e5cb5301           | REG_SZ     | QQBkAGQALQBUAHkAcABlACAALQBUAHk.... | 4.120352779215068  | N/a                | 256    | ['Base64'] |
 | NTUSER   | \Software\Microsoft\Windows\DWM                                                                      | 2025-03-26 11:55:16 | 6e5cb530c           | REG_SZ     | https://4ad74aab.fun/index.php      | 4.031401845392171  | N/a                | 30     | ['URL']    |
-| SOFTWARE | \Microsoft\Windows Defender\Signature Updates                                                        | 2025-03-26 11:57:09 | NISSignatureVersion | REG_SZ     | 119.0.0.0                           | 1.8910611120726526 | N/a                | 9      | ['IP']     |
-| SOFTWARE | \Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tasks\{1450C988-13B2-4C9E-8A39-6984C6D3331F} | 2025-03-26 11:57:46 | Version             | REG_SZ     | 1.3.195.45                          | 2.4464393446710155 | N/a                | 10     | ['IP']     |
-| SOFTWARE | \Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tasks\{9426D946-2504-4F3F-AA13-C0B248516004} | 2025-03-26 11:51:59 | Version             | REG_SZ     | 1.3.195.45                          | 2.4464393446710155 | N/a                | 10     | ['IP']     |
 | SYSTEM   | \ControlSet001\Control\ProductOptions                                                                | 2025-03-26 11:51:44 | ProductPolicy       | REG_BINARY | <BINARY_DATA>                       | 3.3582123455953075 | 3980355.8894219045 | 49196  | []         |
 +--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 ```
 
-## Tool Options 
+## CLI Reference
+
 ```
-usage: FADED ALCHEMIST [-h] --directory DIRECTORY [--restore_hives] [--merge_dfs] [--drop_unknown_reg_types]
-                       [--format {JSON,CSV,ALL}] [--csv] [--json] [--collect-baseline] [--use-baseline USE_BASELINE]
-                       [--comprehensive] [--persistence] [--artefacts] [--shannon_threshold SHANNON_THRESHOLD]
-                       [--length_threshold LENGTH_THRESHOLD] [--dynamic-length-purging] [--verbose] [--name NAME]
+usage: FADED ALCHEMIST [-h] {comprehensive,persistence,artefacts,plugins,list-plugins} ...
 
 Capability to enable detection of malware-induced Windows Registry modifications
 
+positional arguments:
+  {comprehensive,persistence,artefacts,plugins,list-plugins}
+                        Scan mode to run
+    comprehensive       Perform ALL Available Analysis
+    persistence         Discover Persistence on Device via the Registry
+    artefacts           Perform Statistical Analysis of the Registry
+    plugins             Run regipy's built-in artefact plugins against each hive
+    list-plugins        List all available regipy plugins and exit
+
 options:
   -h, --help            show this help message and exit
-  --directory DIRECTORY, -D DIRECTORY
-                        Specify the directory where registry files are stored
-  --restore_hives       Replay Registry Transaction Logs into Hives Where Possible
-  --merge_dfs           Merge All Results in one DataFrame Instead of Per-Hive
-  --drop_unknown_reg_types
-                        Merge All Results in one DataFrame Instead of Per-Hive
+```
+
+`comprehensive`, `persistence`, `artefacts`, and `plugins` all share the same set of options:
+
+```
+  -d, --directory PATH  Specify the directory where registry files are stored
+  --restore-hives       Replay Registry Transaction Logs into Hives Where Possible
+  --drop-unknown-reg-types
+                        Drop values with an unrecognized registry type
   --format {JSON,CSV,ALL}
                         Enable JSON or CSV for output formats
-  --csv                 Enable CSV Mode for Output
-  --json                Enable JSON Mode for Output
+  --show-locations      Include the registry key location/path as a column in output
   --collect-baseline    Dumps Extracted Values JSON & Pickle to Deduplicate Against
   --use-baseline USE_BASELINE
                         Uses Extracted Values JSON/Pickle file to Deduplicate Against
-  --comprehensive, -c   Perform ALL Available Analysis
-  --persistence, -p     Discover Persistence on Device via the Registry
-  --artefacts, -art     Perform Statistical Analysis of the Registry
   --shannon_threshold SHANNON_THRESHOLD
   --length_threshold LENGTH_THRESHOLD
   --dynamic-length-purging
-  --verbose, -v         Verbose logging (i.e Enable DEBUG Mode)
-  --name NAME, -n NAME  Assign a designator to a scan, all saved files used this to identify multiple runs
+  --plugins PLUGINS     Comma-separated regipy plugin names to run (default: all validated plugins)
+  --include-unvalidated-plugins
+                        Also run regipy plugins without validation test cases
+  --verbose, -v         Increase logging verbosity, e.g. -v enables DEBUG logging
+  --name, -n NAME       Assign a designator to a scan, all saved files used this to identify multiple runs
 ```
+
+`list-plugins` takes no options besides `-h`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
