@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="images/logo.png" style="max-width: 300px"/>
+  <img src="images/logo.png" width=275/>
 </p>
 
 # FadedAlchemist — Registry Malware Artefact Discovery
