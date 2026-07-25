@@ -2,9 +2,11 @@ import argparse
 import base64
 import binascii
 import json
+import logging
 import math
 import pickle
 import re
+import secrets
 import statistics
 import time
 from collections import Counter
@@ -14,18 +16,35 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from regipy import RegistryHive
+
+try:
+    #* Try importing the Regipy Rust Backend and use that
+    from regipy.registry_rs import RegistryHive
+except ImportError:
+    #* If not available, fail back to the Python Backend
+    from regipy.registry import RegistryHive
+
+import tldextract
+from regipy.exceptions import (NoRegistrySubkeysException,
+                               RegistryKeyNotFoundException)
+from regipy.plugins.plugin import PLUGINS
+from regipy.plugins.utils import run_relevant_plugins
 from regipy.recovery import apply_transaction_logs
 from regipy.structs import VALUE_TYPE_ENUM
+from regipy.utils import convert_wintime
 from rich import inspect
 from rich.console import Console
+from rich.json import JSON
+from rich.progress import (BarColumn, MofNCompleteColumn, Progress, TextColumn,
+                           TimeRemainingColumn)
 from rich.status import Status
 from rich.table import Table
 from scipy.stats import chisquare
-import tldextract
 
 pd.set_option('display.max_rows', None)
-pd.set_option('future.no_silent_downcasting', True)
+
+#* Make regipy less verbose
+logging.getLogger("regipy").setLevel(logging.ERROR)
 
 def df2table(df,title=""):
     #* Create Rich.Table and Populate with Results
@@ -36,8 +55,9 @@ def df2table(df,title=""):
         t.add_column(col)
         
     #* Add Rows
+    #* Structured (dict/list) cells get rich JSON syntax highlighting instead of a raw str() dump
     for index, row in df.iterrows():
-        t.add_row(*[str(val) for val in row])
+        t.add_row(*[JSON.from_data(val, indent=None) if isinstance(val,(dict,list)) else str(val) for val in row])
     
     return t  
 
@@ -68,21 +88,34 @@ class RegistryCollection():
         """Method to get a specific hive"""
         return self.hives.get(hkey.lower(),None)
     
-    def add_hive(self, hive : RegistryHive):
-        """Method to add Add to Collection"""
-        self.hives.update({hive.hive_type : hive})
+    def add_hive(self, hive : RegistryHive, key : str = None):
+        """Method to add Add to Collection. Defaults to keying by hive_type, but an explicit
+        key can be passed to disambiguate hives that share a type (e.g. NTUSER.DAT per-user)"""
+        self.hives.update({(key or hive.hive_type).lower() : hive})
         
     def get_added_hives_u(self):
         """Method to return all hives in UPPERCASE"""
         return [hive.upper() for hive in self.hives]
         
     def get_added_hives(self):    
-        """Method to return all hives in UPPERCASE"""
+        """Method to return all hives in LOWERCASE"""
         return [hive for hive in self.hives]
 
 class Alchemist():
-    TOOL_CONSOLE_PROMPT = "[ FADED ALCHEMIST :crystal_ball::test_tube: ]"
-    
+    TOOL_CONSOLE_PROMPT = "[spring_green1]FADED ALCHEMIST[/]"
+
+    #* Rich colors assigned per log level
+    LEVEL_STYLES = {
+        "DEBUG": "grey58",
+        "INFO": "cyan",
+        "WARNING": "orange1",
+        "ERROR": "bold red",
+    }
+
+    #* Width of the longest bracketed level tag (e.g. "[WARNING]"), used to
+    #* pad shorter tags with trailing spaces so messages line up
+    TAG_WIDTH = max(len(level) for level in LEVEL_STYLES) + 2
+
     #* Hives that we are interested in
     HIVE_NAMES = ["SYSTEM","SOFTWARE","SECURITY","SAM","NTUSER.DAT"]
     
@@ -97,34 +130,62 @@ class Alchemist():
     REGISTRY = RegistryCollection()
     Extracted_Dict = {}
 
-    
+    #* ASEP (Auto-Start Extensibility Point) locations - shared between the full
+    #* extraction-based scan and the targeted, extraction-free persistence-only scan
+    #* Has removed SOFTWARE/SYSTEM etc as this isn't loaded into an actual registry and those paths wont resolve correctly
+    ASEP_RUNKEYS = {
+        '\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Userinit',
+        '\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run',
+        '\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce',
+        '\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run',
+        '\\CurrentControlSet\\Control\\Session Manager\\BootExecute',
+        '\\CurrentControlSet\\Control\\Session Manager\\SubSystems',
+        '\\Microsoft\\Windows\\CurrentVersion\\Run',
+        '\\Microsoft\\Windows\\CurrentVersion\\RunOnce',
+        '\\Environment\\UserInitMprLogonScript',
+        '\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Shell',
+        '\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce'
+    }
+
+    #* Both Tree and Tasks will also fit this starter
+    ASEP_SCHEDULED_TASK_PREFIX = r"\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree"
+    #* Holds the actual task definition (Path, Actions, etc) keyed by the GUID found under ASEP_SCHEDULED_TASK_PREFIX
+    ASEP_SCHEDULED_TASK_DETAILS_PREFIX = r"\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tasks"
+    ASEP_HKCU_SERVICE_PREFIX = r"\Microsoft\Windows NT\CurrentVersion\Services"
+    ASEP_HKLM_SERVICE_PREFIX = r"\ControlSet001\Services"
+
+    #* Subtree prefixes need a scoped recursive walk, unlike the single-value ASEP_RUNKEYS
+    ASEP_SUBTREE_PREFIXES = (ASEP_SCHEDULED_TASK_PREFIX, ASEP_SCHEDULED_TASK_DETAILS_PREFIX, ASEP_HKCU_SERVICE_PREFIX, ASEP_HKLM_SERVICE_PREFIX)
+
+    #* Windows service Start value -> human-readable start type
+    SERVICE_START_TYPES = {0 : "Boot", 1 : "System", 2 : "Automatic", 3 : "Manual", 4 : "Disabled"}
+
     def __init__(self, args : dict, console : Console = Console()):
         self.console = console
         
         self.registry_files = args.directory
-        self.DEBUG_MODE = args.verbose
-        self.DESIGNATOR = args.name
-        
+
+        #* -v (count) sets both our own DEBUG-level messages and regipy's internal logger
+        self.DEBUG_MODE = args.verbose > 0
+        logging.getLogger("regipy").setLevel(logging.DEBUG if args.verbose > 0 else logging.ERROR)
+
+        #* Fall back to a random designator so saved files/tables never end up named "None"
+        self.DESIGNATOR = args.name or secrets.token_hex(4)
+
         self.CSV_MODE = args.csv
         self.JSON_MODE = args.json
-        
-        self._print(f"[ :toolbox: ] OUTPUT MODE : '{args.format}'")
-        
-        
-        if self.DESIGNATOR:
-            self._print(f"[ :briefcase: ] Assigned Designator '{self.DESIGNATOR}'")
-            self.OUTPUT_DIR = Path().joinpath(self.DESIGNATOR) 
 
-            if not self.OUTPUT_DIR.exists():
-                self.OUTPUT_DIR.mkdir()
-                self._print(f"[ :briefcase: ] Created Output Directory '{self.OUTPUT_DIR}'")
-            else:
-                self._print(f"[ :briefcase: ] Using Output Directory '{self.OUTPUT_DIR}'")
+        self._print(f"Output mode set to '{args.format}'")
 
+        self._print(f"Assigned designator '{self.DESIGNATOR}'")
+        self.OUTPUT_DIR = Path().joinpath(self.DESIGNATOR)
+
+        if not self.OUTPUT_DIR.exists():
+            self.OUTPUT_DIR.mkdir()
+            self._print(f"Created output directory '{self.OUTPUT_DIR}'")
         else:
-            self.OUTPUT_DIR = Path()
-            self._print(f"[ :briefcase: ] Using Output Directory '{self.OUTPUT_DIR}'")
-                    
+            self._print(f"Using output directory '{self.OUTPUT_DIR}'")
+
         #* Baseline Args
         self.COLLECT_BASELINE = args.collect_baseline
         self.Baseline_Data = args.use_baseline
@@ -136,64 +197,87 @@ class Alchemist():
         self.SHANNON_THRESHOLD = args.shannon_threshold or 5.7
         self.LENGTH_THRESHOLD = args.length_threshold or 4096
         self.asep = args.persistence
-    
+        self.RUN_ARTEFACTS = args.artefacts
+        self.SHOW_LOCATIONS = args.show_locations
+
+        #* Plugin Args
+        self.RUN_PLUGINS = args.mode == "plugins"
+        self.PLUGIN_NAMES = {name.strip() for name in args.plugins.split(",")} if args.plugins else None
+        self.INCLUDE_UNVALIDATED_PLUGINS = args.include_unvalidated_plugins
+
+        #* When persistence is the only mode running, ASEP locations can be queried
+        #* directly, skipping the full key extraction that artefacts/comprehensive need
+        self.PERSISTENCE_ONLY = self.asep and not self.RUN_ARTEFACTS
+
+        #* Plugins is its own standalone mode that operates directly on RegistryHive
+        #* objects, so it never needs the full key/value extraction pass either
+        self.SKIP_EXTRACTION = self.PERSISTENCE_ONLY or self.RUN_PLUGINS
+
         #* Collect Registry Files
         self._resolve_registry_files()
-        
+
         collected_hives = self.REGISTRY.get_added_hives_u()
-    
-        self._print(f"[ :arrows_counterclockwise: ] Loaded {len(collected_hives)} Hives : {collected_hives}")
-    
+
+        self._print(f"Loaded {len(collected_hives)} hive(s): {collected_hives}")
+
+        if self.PERSISTENCE_ONLY and (self.COLLECT_BASELINE or self.Baseline_Data):
+            self._print("Baseline options have no effect in persistence-only mode, since no keys are extracted", level="WARNING")
+
         #* Start timer and start hive value extraction
         T1 = datetime.now()
-        self._extract_values_from_hives()
-        
-        #* If Baseline Data is detected remove all baseline data
-        if self.Baseline_Data:
-            self._eliminate_baseline()
-        
-        # if True:
-        #     with open("gootloader_proc.json","r") as f:
-        #         self.Extracted_Dict = json.load(f)
-        #         self._print("Loaded ProcData")
-        
-        # if True:
-        #     with open("Proc_Data2.json","w") as f:
-        #         json.dump(self.Extracted_Dict,f,cls=RegType_JSON_Serialiser)
-        #         self._print("Saved ProcData")
-        
+
+        if not self.SKIP_EXTRACTION:
+            self._extract_values_from_hives()
+
+            #* If Baseline Data is detected remove all baseline data
+            if self.Baseline_Data:
+                self._eliminate_baseline()
+
         T2 = datetime.now()
-        self._print(f"[ :alarm_clock: ] Finished Processing Device in : {T2 - T1}")
-                    
-        self._add_analytics()
-        
+        self._print(f"Finished processing device in {T2 - T1}")
+
+        if self.RUN_ARTEFACTS:
+            self._add_analytics()
+
         if self.asep:
-            self._find_asep()
-        
+            if self.PERSISTENCE_ONLY:
+                self._find_asep_targeted()
+            else:
+                self._find_asep()
+
+        if self.RUN_PLUGINS:
+            self._run_plugins()
+
         T3 = datetime.now()
-        self._print(f"[ :alarm_clock: ] Finished Analzysing Device in : {T3 - T2}")
-        
-        self._get_meaningful_results()
+        self._print(f"Finished analyzing device in {T3 - T2}")
+
+        if self.RUN_ARTEFACTS:
+            self._get_meaningful_results()
         
         
     def _write_table(self,t,name):
         with self.OUTPUT_DIR.joinpath(f"{name}.table").open("wt") as report_file:
             console = Console(file=report_file,width=700)
-            console.rule(f"Writing {name} Table - {datetime.now().ctime()}")
+            console.print(f"Writing {name} Table - {datetime.now().ctime()}\n\n\n")
             console.print(t)
                 
-    def _print(self,message : str, debug: bool = False):
-        """Method to print to the console via rich"""
-                
-        if debug:
-            if self.DEBUG_MODE:
-                self.console.print(f"{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} {self.TOOL_CONSOLE_PROMPT} [DEBUG] - {message}")
-        else:
-            self.console.print(f"{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} {self.TOOL_CONSOLE_PROMPT} - {message}")        
+    def _format_message(self, message : str, level: str = "INFO") -> str:
+        """Builds the timestamped, leveled, colored line shared by _print and any live rich widgets (e.g. Progress)"""
+        style = self.LEVEL_STYLES.get(level, "white")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return f"{timestamp} - {self.TOOL_CONSOLE_PROMPT} - [{style}]{level}:[/{style}] {message}"
+
+    def _print(self,message : str, level: str = "INFO"):
+        """Method to print timestamped, leveled log messages to the console via rich"""
+
+        if level == "DEBUG" and not self.DEBUG_MODE:
+            return
+
+        self.console.print(self._format_message(message, level))
 
     def _eliminate_baseline(self):
         """Method to remove previously seen data (Baseline data) from the Extracted_Dict"""
-        self._print(f"[ :bookmark: ] Reading Baseline from '{self.Baseline_Data.resolve()}'")
+        self._print(f"Reading baseline from '{self.Baseline_Data.resolve()}'")
         
         JSON_BASELINE = False
         
@@ -211,7 +295,7 @@ class Alchemist():
         Baseline_Records_Summary = {k.upper() : len(v) for k,v in BaselineExtracted.items()}
         Total_Records = sum(len(arr) for arr in BaselineExtracted.values())
         Total_Records_Removed = 0
-        self._print(f"[ :bookmark_tabs: ] Read {Total_Records} Baseline Records : {Baseline_Records_Summary}")
+        self._print(f"Read {Total_Records} baseline record(s): {Baseline_Records_Summary}")
         
         for hive_name in self.Extracted_Dict:
             Hive_Extracted_Values = self.Extracted_Dict.get(hive_name,None)
@@ -259,13 +343,13 @@ class Alchemist():
             Record_Delta = Start_Amount_Of_Records - End_Amount_Of_Records
             Total_Records_Removed += Record_Delta
             
-            self._print(f"[ :axe: ] Removed {Record_Delta} Baseline Records From '{hive_name.upper()}' - {End_Amount_Of_Records} Remaining")
-            self.Extracted_Dict.update({hive_name : Deduplicated_Data})   
-            
-        self._print(f"[ :toolbox: ] Removed {Total_Records_Removed} Baseline Records")
-        
+            self._print(f"Removed {Record_Delta} baseline record(s) from '{hive_name.upper()}', {End_Amount_Of_Records} remaining")
+            self.Extracted_Dict.update({hive_name : Deduplicated_Data})
+
+        self._print(f"Removed {Total_Records_Removed} baseline record(s) in total")
+
         Data_Reduction_Percentage = (Total_Records_Removed / self.total_records_extracted) * 100
-        self._print(f"[ :toolbox: ] Total Data Reduction - {Data_Reduction_Percentage:.2f}%")
+        self._print(f"Total data reduction: {Data_Reduction_Percentage:.2f}%")
 
     def _extract_values_from_hives(self):
         """Method to kickoff analysis of all hives"""
@@ -279,7 +363,7 @@ class Alchemist():
                 if not hive:
                     continue 
                 
-                status.update(f"[ :fire: ] Starting Extraction of '{hive.hive_type.upper()}'")
+                status.update(f"Starting extraction of '{hive.hive_type.upper()}'")
                 
                 #* Use List Comprehension for Speed & Opti, get all entries first
                 hive_entries = [entry for entry in hive.recurse_subkeys()]
@@ -300,11 +384,11 @@ class Alchemist():
                     extracted_values = [entry for entry in extracted_values if not entry["Value_Type"].isdigit()]
 
                 values_extracted += len(extracted_values)
-                self._print(f"[ :tractor: ] Extracted {len(extracted_values)} out of '{hive_name.upper()}'")
-                
+                self._print(f"Extracted {len(extracted_values)} value(s) from '{hive_name.upper()}'")
+
                 self.Extracted_Dict[hive_name] = extracted_values
-            
-            self._print(f"[ :toolbox: ] Extracted {values_extracted} Total Values")
+
+            self._print(f"Extracted {values_extracted} value(s) in total")
             self.total_records_extracted = values_extracted
             
             if self.COLLECT_BASELINE:
@@ -322,27 +406,30 @@ class Alchemist():
                     file.parent.name not in self.DEFEAT_DIRECTORIES
                 ]
 
-        self._print(f"[ :magnifying_glass_tilted_right: ] Discovered {len(HIVES)} Hives : {[f.name for f in HIVES]}")
+        self._print(f"Discovered {len(HIVES)} hive(s): {[f.name for f in HIVES]}")
         
-        with console.status("Resolving Registry Hives", spinner="moon"):
+        with self.console.status("Resolving Registry Hives", spinner="moon"):
             for HIVE in HIVES:
                 time.sleep(0.1)
 
                 h = RegistryHive(HIVE)
-                
+
+                #* NTUSER.DAT is per-user, so keying purely by hive_type would collide across
+                #* profiles - key it by the owning username (the hive's parent directory) instead
+                hive_key = f"NTUSER[{HIVE.parent.name}]" if HIVE.name == "NTUSER.DAT" else None
+
                 if (h.header.primary_sequence_num != h.header.secondary_sequence_num):
                     #* If the hive is dirty then lets discover the LOG files for this
-                    self._print(f"[ :soap: ] Dirty '{HIVE.name}' Hive Detected : [1st {h.header.primary_sequence_num} <!> 2nd {h.header.secondary_sequence_num}]")
+                    self._print(f"Dirty hive detected: '{HIVE.name}' (primary sequence {h.header.primary_sequence_num}, secondary sequence {h.header.secondary_sequence_num})", level="WARNING")
 
                     if not self.RESTORE_HIVES:
-                        #* Notify the user of the sequence number mismatch without replaying the transaction logs
-                        self._print(f"[ :warning: ] Sequence Number Mismatch in '{HIVE.name}' - Transaction Logs Will NOT Be Applied (use --restore_hives to replay)")
-                        self.REGISTRY.add_hive(h)
+                        #* Only replay transactions if this argument is enabled
+                        self.REGISTRY.add_hive(h, key=hive_key)
                         continue
 
                     #* Search for only LOG1 and LOG2 files of the same name in the same directory
                     LOGS = list(HIVE.parent.rglob(f"*{HIVE.name}.LOG[12]"))
-                    self._print(f"Discovered {len(LOGS)} Transaction Logs for {HIVE.name} : {[f.name for f in LOGS]}",debug=True)
+                    self._print(f"Discovered {len(LOGS)} transaction log(s) for {HIVE.name}: {[f.name for f in LOGS]}",level="DEBUG")
 
                     #* Assign only the correct logs to the right variable and ensure that the file is actually populated as Regipy doesnt check for this
 
@@ -352,20 +439,70 @@ class Alchemist():
                     secondary_log = [f for f in LOGS if f.suffix == ".LOG2" and f.stat().st_size > 0] or None
                     secondary_log = secondary_log[0] if secondary_log else None
 
-                    self._print(f"Valid Transaction Logs for {HIVE.name} : {[x.name for x in [primary_log,secondary_log] if x != None]}",debug=True)
+                    self._print(f"Valid transaction log(s) for {HIVE.name}: {[x.name for x in [primary_log,secondary_log] if x != None]}",level="DEBUG")
 
-                    #* Create a restored hive by applying transaction logs onto the hive
-                    restored_hive, dirty_hive_count = apply_transaction_logs(HIVE,primary_log_path=primary_log,secondary_log_path=secondary_log,verbose=True)
-                    self._print(f"[ :magnet: ] Replayed {dirty_hive_count} Transactions into '{HIVE.name}'")
                     try:
+                        #* Create a restored hive by applying transaction logs onto the hive
+                        restored_hive, dirty_hive_count = apply_transaction_logs(HIVE,primary_log_path=primary_log,secondary_log_path=secondary_log,verbose=True)
+                        self._print(f"Replayed {dirty_hive_count} transaction(s) into '{HIVE.name}'")
                         h = RegistryHive(restored_hive)
-                        self.REGISTRY.add_hive(h)
+                        self.REGISTRY.add_hive(h, key=hive_key)
                     except:
-                        self.REGISTRY.add_hive(h)
+                        self.REGISTRY.add_hive(h, key=hive_key)
 
                 else:
-                    self.REGISTRY.add_hive(h)
-                    self._print(f"[ :white_heavy_check_mark: ] Hive '{HIVE.name}' Passed All Checks")
+                    self.REGISTRY.add_hive(h, key=hive_key)
+                    self._print(f"Hive '{HIVE.name}' passed all integrity checks",level="DEBUG")
+
+    def _run_plugins(self):
+        '''Runs regipy's built-in artefact plugins against every collected hive.
+        Plugin compatibility is matched against each hive's actual hive_type,
+        independent of the key it was stored under in the RegistryCollection'''
+        self._print(f"Running plugins ({len(PLUGINS)} available, {'all' if not self.PLUGIN_NAMES else ', '.join(sorted(self.PLUGIN_NAMES))})")
+
+        self.Plugin_Results = {}
+
+        with Status("[bold green] Running plugins", spinner="dots", console=self.console) as status:
+            for hive_name in self.REGISTRY.get_added_hives():
+                hive = self.REGISTRY.get_hive(hive_name)
+                if not hive:
+                    continue
+
+                status.update(f"Running plugins against '{hive_name.upper()}'")
+
+                results = run_relevant_plugins(
+                    hive,
+                    as_json=True,
+                    plugins=self.PLUGIN_NAMES,
+                    include_unvalidated=self.INCLUDE_UNVALIDATED_PLUGINS,
+                )
+
+                #* Only keep plugins that actually produced entries
+                results = {name: entries for name, entries in results.items() if entries}
+
+                if results:
+                    self._print(f"'{hive_name.upper()}': {len(results)} plugin(s) with results - {list(results.keys())}")
+                    self.Plugin_Results[hive_name] = results
+
+        if self.JSON_MODE:
+            with self.OUTPUT_DIR.joinpath(f"{self.DESIGNATOR}_Plugins.json").open("w") as f:
+                json.dump(self.Plugin_Results, f, cls=RegType_JSON_Serialiser, indent=2)
+
+        #* Plugin output shapes vary per-plugin, so CSV only gets the summary counts below, not raw entries
+        summary_rows = [
+            [hive_name.upper(), plugin_name, len(entries)]
+            for hive_name, plugins in self.Plugin_Results.items()
+            for plugin_name, entries in plugins.items()
+        ]
+        summary_df = pd.DataFrame(summary_rows, columns=["Hive", "Plugin", "Entries"])
+
+        if self.CSV_MODE:
+            summary_df.to_csv(self.OUTPUT_DIR.joinpath(f"{self.DESIGNATOR}_Plugins.csv"))
+
+        print()
+        t = df2table(summary_df, title="Plugin Results Summary")
+        self.console.print(t)
+        self._write_table(t=t, name="Plugins")
 
     def _get_meaningful_results(self):
         '''Function to extract only meaningful results'''
@@ -627,7 +764,7 @@ class Alchemist():
                     if ip.is_global:
                         Discovered_Marks.append('IP')
                     else:
-                        self._print(f"{ip} is not Global",debug=True)
+                        self._print(f"'{ip}' is not a global address",level="DEBUG")
                 except:
                     pass
                 
@@ -637,7 +774,7 @@ class Alchemist():
                     url = tldextract.extract(text)
                     #* if the URL is a Microsoft owned one or it has no suffix (is internally routed i.e. HTTP://HOSTNAME) ignore it
                     if url.domain.lower() in ["microsoft","skype","live","windows","bing","hotmail","outlook"] or url.suffix == "":
-                        self._print(f"{text} is either owned by Microsoft or likely invalid",debug=True)
+                        self._print(f"'{text}' is either Microsoft-owned or likely invalid",level="DEBUG")
                     else:
                         Discovered_Marks.append('URL')
         
@@ -659,62 +796,170 @@ class Alchemist():
             return Discovered_Marks
         
         except Exception as e:
-            self._print(f"Issue Occured within Discovered Marks - {e}",debug=True)
+            self._print(f"Issue occurred while discovering marks: {e}",level="DEBUG")
             return []
     
     def _find_asep(self):
-        df = self.results_df[["Key_Path","Value_Name","Value"]]
+        '''ASEP scan using values already extracted for statistical analysis'''
+        df = self.results_df[["Key_Path","Value_Name","Value","TS"]]
         data = df.to_dict(orient='records')
-        
-        #* Has removed SOFTWARE/SYSTEM etc as this isn't loaded into an actual registry and those paths wont resolve correctly
-        ASEP_RUNKEYS = {
-            '\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Userinit', 
-            '\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run', 
-            '\\Wow6432Npde\\Microsoft\\Windows\\CurrentVersion\\RunOnce', 
-            '\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run', 
-            '\\CurrentControlSet\\Control\\Session Manager\\BootExecute', 
-            '\\CurrentControlSet\\Control\\Session Manager\\SubSystems', 
-            '\\Microsoft\\Windows\\CurrentVersion\\Run', 
-            '\\Microsoft\\Windows\\CurrentVersion\\RunOnce', 
-            '\\Environment\\UserInitMprLogonScript', 
-            '\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Shell', 
-            '\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce'
-        }    
-        
-        #* Both Tree and Tasks will also fit this starter
-        SCHEDULED_TASK_NAME_START = r"\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree"
-        HKCU_SERVICE_START = r"\Microsoft\Windows NT\CurrentVersion\Services"
-        HKLM_SYSTEM_SERVICE_START = r"\ControlSet001\Services"
+
+        self._report_asep(self._build_asep_vectors(data))
+
+    def _find_asep_targeted(self):
+        '''ASEP scan that queries only the known ASEP locations directly via regipy,
+        instead of extracting every key/value in the hive first. Used when persistence
+        is the only mode running, so the full extraction pass can be skipped entirely'''
+        self._print("Persistence-only mode: querying known ASEP locations directly, skipping full key/value extraction")
+
+        records = []
+
+        #* Build the full list of (hive, key_path, is_subtree) lookups so progress can be shown per-location
+        jobs = []
+        for hive_name in self.REGISTRY.get_added_hives():
+            hive = self.REGISTRY.get_hive(hive_name)
+            if not hive:
+                continue
+
+            #* Single-value autorun keys - read directly, no need to recurse
+            jobs.extend((hive_name, hive, key_path, False) for key_path in self.ASEP_RUNKEYS)
+
+            #* Scheduled tasks / services live under subtrees, so scope the recursion to just those
+            jobs.extend((hive_name, hive, prefix, True) for prefix in self.ASEP_SUBTREE_PREFIXES)
+
+        progress_columns = (
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+        )
+
+        with Progress(*progress_columns, console=self.console) as progress:
+            task = progress.add_task(self._format_message("Scanning ASEP locations"), total=len(jobs))
+
+            for hive_name, hive, key_path, is_subtree in jobs:
+                if is_subtree:
+                    records.extend(self._read_subtree_values(hive, key_path))
+                else:
+                    records.extend(self._read_key_values(hive, key_path))
+
+                progress.advance(task)
+
+        if self.DROP_UNKNOWN:
+            records = [record for record in records if not record["Value_Type"].isdigit()]
+
+        self._print(f"Discovered {len(records)} ASEP-relevant value(s) via targeted lookups")
+
+        self._report_asep(self._build_asep_vectors(records))
+
+    def _read_key_values(self, hive, key_path):
+        '''Reads the values directly under a single known registry key, without recursing'''
+        try:
+            subkey = hive.get_key(key_path)
+        except (RegistryKeyNotFoundException, NoRegistrySubkeysException):
+            return []
+
+        ts = convert_wintime(subkey.header.last_modified).strftime("%Y-%m-%d %H:%M:%S")
+
+        return [
+            {"Key_Path" : key_path, "Value_Name" : value.name, "Value_Type" : str(value.value_type), "Value" : value.value, "TS" : ts}
+            for value in subkey.iter_values()
+        ]
+
+    def _read_subtree_values(self, hive, key_path):
+        '''Recurses only the given subtree instead of walking the whole hive'''
+        try:
+            subkey = hive.get_key(key_path)
+        except (RegistryKeyNotFoundException, NoRegistrySubkeysException):
+            return []
+
+        return [
+            {"Key_Path" : entry.path, "Value_Name" : value.name, "Value_Type" : str(value.value_type), "Value" : value.value, "TS" : entry.timestamp.strftime("%Y-%m-%d %H:%M:%S")}
+            for entry in hive.recurse_subkeys(nk_record=subkey, path_root=key_path)
+            for value in entry.values
+        ]
+
+    def _build_asep_vectors(self, data):
+        '''Matches extracted Key_Path/Value_Name/Value records against known ASEP locations'''
         ASEP_Vectors = []
-        
-        #* Try and Find Scheduled Task in Differential Data
+
+        #* Group sibling values by key path so services/tasks can be enriched with more than one field
+        values_by_path = {}
+        for record in data:
+            values_by_path.setdefault(record["Key_Path"], {})[record["Value_Name"]] = record["Value"]
+
         for record in data:
             #* Try and Find Scheduled Tasks and their associated ID
-            if record["Key_Path"].startswith(SCHEDULED_TASK_NAME_START) and record["Value_Name"] == "Id":
+            if record["Key_Path"].startswith(self.ASEP_SCHEDULED_TASK_PREFIX) and record["Value_Name"] == "Id":
                 Name = record["Key_Path"].split("\\")[-1]
                 ID = record["Value"]
-                ASEP_Vectors.append(["SCHEDULED_TASK",Name,ID])
-                
-            #* Try and find HKLM bound services 
-            elif record["Key_Path"].startswith(HKLM_SYSTEM_SERVICE_START) and record["Value_Name"] == "DisplayName":
+                task_details = values_by_path.get(f"{self.ASEP_SCHEDULED_TASK_DETAILS_PREFIX}\\{ID}", {})
+                Context = self._format_task_context(ID, task_details)
+                ASEP_Vectors.append(["SCHEDULED_TASK",Name,Context,record["TS"],record["Key_Path"]])
+
+            #* Try and find HKLM bound services
+            elif record["Key_Path"].startswith(self.ASEP_HKLM_SERVICE_PREFIX) and record["Value_Name"] == "DisplayName":
                 Name = record["Key_Path"].split("\\")[-1]
-                DisplayName = record["Value"]
-                ASEP_Vectors.append(["HKLM_SERVICE",Name,DisplayName])
-                
+                Context = self._format_service_context(record["Value"], values_by_path.get(record["Key_Path"], {}))
+                ASEP_Vectors.append(["HKLM_SERVICE",Name,Context,record["TS"],record["Key_Path"]])
+
             #* Try and find HKCU bound services
-            elif record["Key_Path"].startswith(HKCU_SERVICE_START) and record["Value_Name"] == "DisplayName":
+            elif record["Key_Path"].startswith(self.ASEP_HKCU_SERVICE_PREFIX) and record["Value_Name"] == "DisplayName":
                 Name = record["Key_Path"].split("\\")[-1]
-                DisplayName = record["Value"]
-                ASEP_Vectors.append(["HKCU_SERVICE",Name,DisplayName])
-                
-            elif record["Key_Path"] in ASEP_RUNKEYS:
-                ASEP_Vectors.append(["AUTORUNS",record["Value"],record["Value_Name"]])
-        
-        asep_df = pd.DataFrame(columns=["Method","Value","Context"],data=ASEP_Vectors)
-        
+                Context = self._format_service_context(record["Value"], values_by_path.get(record["Key_Path"], {}))
+                ASEP_Vectors.append(["HKCU_SERVICE",Name,Context,record["TS"],record["Key_Path"]])
+
+            elif record["Key_Path"] in self.ASEP_RUNKEYS:
+                ASEP_Vectors.append(["AUTORUNS",record["Value"],record["Value_Name"],record["TS"],record["Key_Path"]])
+
+        return ASEP_Vectors
+
+    def _format_service_context(self, display_name, service_values):
+        '''Builds a structured (JSON-serializable) summary of a service's most relevant registry values'''
+        context = {}
+
+        start = service_values.get("Start")
+        if start is not None:
+            try:
+                start = self.SERVICE_START_TYPES.get(int(start), start)
+            except (TypeError, ValueError):
+                pass
+            context["start"] = start
+
+        account = service_values.get("ObjectName")
+        if account:
+            context["account"] = account
+
+        image_path = service_values.get("ImagePath")
+        if image_path:
+            context["Image"] = image_path
+
+        context["value"] = display_name
+
+        return context
+
+    def _format_task_context(self, task_id, task_values):
+        '''Builds a structured (JSON-serializable) summary of a scheduled task using its TaskCache\\Tasks details'''
+        context = {}
+
+        path = task_values.get("Path")
+        if path:
+            context["path"] = path
+
+        context["value"] = task_id
+
+        return context
+
+    def _report_asep(self, ASEP_Vectors):
+        '''Writes the discovered ASEP vectors to CSV/JSON and prints/persists the results table'''
+        asep_df = pd.DataFrame(columns=["ASEP Vector","Value","Context","Key Written","Location"],data=ASEP_Vectors)
+
+        #* Location is opt-in via --show-locations, regardless of which scan mode is running
+        if not self.SHOW_LOCATIONS:
+            asep_df = asep_df.drop(columns=["Location"])
+
         if self.CSV_MODE:
             asep_df.to_csv(self.OUTPUT_DIR.joinpath(f"{self.DESIGNATOR}_ASEP_Results.csv"))
-        
+
         if self.JSON_MODE:
             asep_df.to_json(self.OUTPUT_DIR.joinpath(f"{self.DESIGNATOR}_ASEP_Results.json"),orient="records")
 
@@ -754,64 +999,81 @@ class Alchemist():
 if __name__ == "__main__":
     console = Console()
 
-    parser = argparse.ArgumentParser(prog="FADED ALCHEMIST", description="Capability to enable detection of malware-induced Windows Registry modifications")
+    #* Arguments shared by every scan mode
+    common = argparse.ArgumentParser(add_help=False)
 
-    #* Required Arguments    
-    parser.add_argument("-d", "--directory", type=Path, help="Specify the directory where registry files are stored", required=True)
-    
-    #* Processing Flags 
-    parser.add_argument("--restore_hives", action="store_true", help="Replay Registry Transaction Logs into Hives Where Possible")
-    parser.add_argument("--merge_dfs", action="store_true", help="Merge All Results in one DataFrame Instead of Per-Hive",default=True)
-    parser.add_argument("--drop_unknown_reg_types", action="store_true", help="Merge All Results in one DataFrame Instead of Per-Hive",default=True)
-    
+    #* Required Arguments
+    common.add_argument("-d", "--directory", type=Path, help="Specify the directory where registry files are stored", required=True, metavar = "PATH")
+
+    #* Processing Flags
+    common.add_argument("--restore-hives", action="store_true", help="Replay Registry Transaction Logs into Hives Where Possible")
+    common.add_argument("--drop-unknown-reg-types", action="store_true", help="Drop values with an unrecognized registry type",default=True)
+
     #* Output flags
-    parser.add_argument("--format",choices=["JSON","CSV","ALL"],action="store",help="Enable JSON or CSV for output formats",default="JSON")
-    parser.add_argument("--csv",action="store_true",help="Enable CSV Mode for Output")
-    parser.add_argument("--json",action="store_true",help="Enable JSON Mode for Output")
-    
-    #* Baseline Arguments
-    parser.add_argument("--collect-baseline",action="store_true",help="Dumps Extracted Values JSON & Pickle to Deduplicate Against")
-    parser.add_argument("--use-baseline",action="store",type=Path,help="Uses Extracted Values JSON/Pickle file to Deduplicate Against")
-    
-    #* Scan Types
-    parser.add_argument("--comprehensive", "-c", action="store_true", help="Perform ALL Available Analysis")
-    parser.add_argument("--persistence", "-p", action="store_true", help="Discover Persistence on Device via the Registry")    
-    parser.add_argument("--artefacts", "-art", action="store_true", help="Perform Statistical Analysis of the Registry")
+    common.add_argument("--format",choices=["JSON","CSV","ALL"],action="store",type=str.upper,help="Enable JSON or CSV for output formats",default="JSON")
+    common.add_argument("--show-locations",action="store_true",help="Include the registry key location/path as a column in output")
 
-    #! Scan Type - Not Implemented (Out of Scope)
-    # parser.add_argument("--mru", "-m", action="store_true", help="Discover MRU Objects in the Registry")    
+    #* Baseline Arguments
+    common.add_argument("--collect-baseline",action="store_true",help="Dumps Extracted Values JSON & Pickle to Deduplicate Against")
+    common.add_argument("--use-baseline",action="store",type=Path,help="Uses Extracted Values JSON/Pickle file to Deduplicate Against")
 
     #* Statistical Analysis Thresholds and Flags
-    parser.add_argument("--shannon_threshold",type=float,action="store")
-    parser.add_argument("--length_threshold",type=float,action="store")
-    parser.add_argument("--dynamic-length-purging",action="store_true")
-    
-    #* Extra Arguments 
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging (i.e Enable DEBUG Mode)")
-    parser.add_argument("--name", "-n", action="store", type=lambda x : x.strip(),help="Assign a designator to a scan, all saved files used this to identify multiple runs")
-    
+    common.add_argument("--shannon_threshold",type=float,action="store")
+    common.add_argument("--length_threshold",type=float,action="store")
+    common.add_argument("--dynamic-length-purging",action="store_true")
+
+    #* Plugin Arguments (only meaningful in "plugins" mode)
+    common.add_argument("--plugins", action="store", type=str, help="Comma-separated regipy plugin names to run (default: all validated plugins)")
+    common.add_argument("--include-unvalidated-plugins", action="store_true", help="Also run regipy plugins without validation test cases")
+
+    #* Extra Arguments
+    common.add_argument("--verbose", "-v", action="count", default=0, help="Increase logging verbosity, e.g. -v enables DEBUG logging")
+    common.add_argument("--name", "-n", action="store", type=lambda x : x.strip(),help="Assign a designator to a scan, all saved files used this to identify multiple runs")
+
+    parser = argparse.ArgumentParser(prog="FADED ALCHEMIST", description="Capability to enable detection of malware-induced Windows Registry modifications")
+
+    #* Scan Types - each mode is its own subcommand, exactly one is run per invocation
+    subparsers = parser.add_subparsers(dest="mode", required=True, help="Scan mode to run")
+    subparsers.add_parser("comprehensive", parents=[common], help="Perform ALL Available Analysis")
+    subparsers.add_parser("persistence", parents=[common], help="Discover Persistence on Device via the Registry")
+    subparsers.add_parser("artefacts", parents=[common], help="Perform Statistical Analysis of the Registry")
+    subparsers.add_parser("plugins", parents=[common], help="Run regipy's built-in artefact plugins against each hive")
+    subparsers.add_parser("list-plugins", help="List all available regipy plugins and exit")
+
     args = parser.parse_args()
-    
-    if args.comprehensive:
-        args.artefacts = True
-        args.persistence = True
-        args.mru = True 
-    
+
+    if args.mode == "list-plugins":
+        table = Table(title=f"Available regipy Plugins ({len(PLUGINS)})")
+        table.add_column("Name")
+        table.add_column("Compatible Hive")
+        table.add_column("Description")
+        for plugin in sorted(PLUGINS, key=lambda p: p.NAME or ""):
+            table.add_row(plugin.NAME, plugin.COMPATIBLE_HIVE.upper(), plugin.DESCRIPTION)
+        console.print(table)
+        raise SystemExit(0)
+
+    #* Translate the chosen mode into the flags the rest of the tool expects
+    args.persistence = args.mode in ("comprehensive", "persistence")
+    args.artefacts = args.mode in ("comprehensive", "artefacts")
+
+    #* --format is the single source of truth for output mode
+    args.json = False
+    args.csv = False
+
     match args.format:
         case "JSON":
             args.json = True
-        
+
         case "CSV":
             args.csv = True
-        
+
         case "ALL":
             args.json, args.csv = True,True
-    
-    ACCEPT_BASELINE_SUFFIX = [".p",".pickle",".json"]
-    
+
+    ACCEPTED_BASELINE_SUFFIXS = [".p",".pickle",".json"]
+
     if args.use_baseline:
-        if args.use_baseline.suffix.lower() not in ACCEPT_BASELINE_SUFFIX:
-            console.print(f"[ :loudspeaker: ] ERROR - Invalid Baseline Extension '{args.use_baseline.suffix}' : Accepted {ACCEPT_BASELINE_SUFFIX} ")
-            exit()
-    
+        if args.use_baseline.suffix.lower() not in ACCEPTED_BASELINE_SUFFIXS:
+            parser.error(f"Invalid baseline extension '{args.use_baseline.suffix}' : accepted {ACCEPTED_BASELINE_SUFFIXS}")
+
     Alchemist(args=args,console=console)
