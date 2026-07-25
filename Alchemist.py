@@ -130,6 +130,7 @@ class Alchemist():
         self.Baseline_Data = args.use_baseline
         
         #* Processing Args
+        self.RESTORE_HIVES = args.restore_hives
         self.DROP_UNKNOWN = args.drop_unknown_reg_types
         self.DLP = args.dynamic_length_purging
         self.SHANNON_THRESHOLD = args.shannon_threshold or 5.7
@@ -332,21 +333,27 @@ class Alchemist():
                 if (h.header.primary_sequence_num != h.header.secondary_sequence_num):
                     #* If the hive is dirty then lets discover the LOG files for this
                     self._print(f"[ :soap: ] Dirty '{HIVE.name}' Hive Detected : [1st {h.header.primary_sequence_num} <!> 2nd {h.header.secondary_sequence_num}]")
-                     
-                    #* Search for only LOG1 and LOG2 files of the same name in the same directory 
+
+                    if not self.RESTORE_HIVES:
+                        #* Notify the user of the sequence number mismatch without replaying the transaction logs
+                        self._print(f"[ :warning: ] Sequence Number Mismatch in '{HIVE.name}' - Transaction Logs Will NOT Be Applied (use --restore_hives to replay)")
+                        self.REGISTRY.add_hive(h)
+                        continue
+
+                    #* Search for only LOG1 and LOG2 files of the same name in the same directory
                     LOGS = list(HIVE.parent.rglob(f"*{HIVE.name}.LOG[12]"))
                     self._print(f"Discovered {len(LOGS)} Transaction Logs for {HIVE.name} : {[f.name for f in LOGS]}",debug=True)
 
                     #* Assign only the correct logs to the right variable and ensure that the file is actually populated as Regipy doesnt check for this
-                
+
                     primary_log = [f for f in LOGS if f.suffix == ".LOG1" and f.stat().st_size > 0]
                     primary_log = primary_log[0] if primary_log else None
-                    
+
                     secondary_log = [f for f in LOGS if f.suffix == ".LOG2" and f.stat().st_size > 0] or None
                     secondary_log = secondary_log[0] if secondary_log else None
-                    
+
                     self._print(f"Valid Transaction Logs for {HIVE.name} : {[x.name for x in [primary_log,secondary_log] if x != None]}",debug=True)
-                    
+
                     #* Create a restored hive by applying transaction logs onto the hive
                     restored_hive, dirty_hive_count = apply_transaction_logs(HIVE,primary_log_path=primary_log,secondary_log_path=secondary_log,verbose=True)
                     self._print(f"[ :magnet: ] Replayed {dirty_hive_count} Transactions into '{HIVE.name}'")
@@ -355,7 +362,7 @@ class Alchemist():
                         self.REGISTRY.add_hive(h)
                     except:
                         self.REGISTRY.add_hive(h)
-                                    
+
                 else:
                     self.REGISTRY.add_hive(h)
                     self._print(f"[ :white_heavy_check_mark: ] Hive '{HIVE.name}' Passed All Checks")
@@ -750,10 +757,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="FADED ALCHEMIST", description="Capability to enable detection of malware-induced Windows Registry modifications")
 
     #* Required Arguments    
-    parser.add_argument("--directory", "-D", type=Path, help="Specify the directory where registry files are stored", required=True)
+    parser.add_argument("-d", "--directory", type=Path, help="Specify the directory where registry files are stored", required=True)
     
     #* Processing Flags 
-    parser.add_argument("--restore_hives", action="store_true", help="Replay Registry Transaction Logs into Hives Where Possible",default=True)
+    parser.add_argument("--restore_hives", action="store_true", help="Replay Registry Transaction Logs into Hives Where Possible")
     parser.add_argument("--merge_dfs", action="store_true", help="Merge All Results in one DataFrame Instead of Per-Hive",default=True)
     parser.add_argument("--drop_unknown_reg_types", action="store_true", help="Merge All Results in one DataFrame Instead of Per-Hive",default=True)
     
